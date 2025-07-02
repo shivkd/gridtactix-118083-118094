@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from enum import Enum
 import sqlite3
 import threading
+import os
 
 # FastAPI App Metadata
 app = FastAPI(
@@ -74,6 +75,13 @@ def init_db():
         conn.commit()
         conn.close()
 init_db()
+
+
+# If launched directly, run the FastAPI server on 0.0.0.0 (all interfaces) and the port given by environment variable or 8000
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("src.api.main:app", host="0.0.0.0", port=port, reload=False)
 
 # ENUMs
 class StatusEnum(str, Enum):
