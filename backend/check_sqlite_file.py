@@ -1,8 +1,6 @@
 import os
 import sys
 
-import sys
-
 def locate_db_file():
     possible_paths = [
         os.environ.get("SQLITE_DB"),

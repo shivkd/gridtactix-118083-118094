@@ -1,3 +1,4 @@
+import sys
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional, Set
@@ -29,7 +30,6 @@ app.add_middleware(
 )
 
 # Database helper (singleton)
-import sys
 
 # Use the correct path if not found in current dir
 def locate_db_file():
