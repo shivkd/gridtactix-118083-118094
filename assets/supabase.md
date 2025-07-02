@@ -1,21 +1,24 @@
 # Supabase Integration & Backend Migration Guide
 
-## Credentials Storage
+This backend now uses Supabase/Postgres **instead of** a local SQLite DB.
 
-- Supabase project credentials (URL, API key, and database URL) are now securely stored in `backend/.env`, which must never be committed to source control.
-    - `SUPABASE_URL`: https://plzaymbonadzwjcrskld.supabase.co
-    - `SUPABASE_KEY`: [REDACTED]
-    - `SUPABASE_DB_URL`: postgresql://postgres:[YOUR_DB_PASSWORD]@db.plzaymbonadzwjcrskld.supabase.co:5432/postgres
+## 1. Environment/Secrets
 
-## FastAPI Backend Configuration Changes
+All backend authentication/secrets must be in `backend/.env` (never commit to Git). **Required keys:**
+- `SUPABASE_URL`: e.g. `https://YOUR_PROJECT_REF.supabase.co`
+- `SUPABASE_KEY`: (Service key from your Supabase project)
+- `SUPABASE_DB_URL`: e.g. `postgresql://postgres:YOUR_DB_PASSWORD@db.YOUR_PROJECT_REF.supabase.co:5432/postgres`
 
-- The backend now connects to the Supabase Postgres database **instead of local SQLite**.
-- Database clients are switched to async SQLAlchemy (`sqlalchemy[asyncio]`) + `asyncpg`.
-- The `.env` file must be present for the FastAPI backend to connect.
+Example `.env`:
+```
+SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+SUPABASE_KEY=eyJhb...
+SUPABASE_DB_URL=postgresql://postgres:YOUR_DB_PASSWORD@db.YOUR_PROJECT_REF.supabase.co:5432/postgres
+```
 
-## Database Schema Sync
+## 2. Database Schema Requirements
 
-The following tables are required on Supabase Postgres (run with Alembic/migrations or manually if not present):
+The backend requires these tables with proper foreign keys:
 
 ```sql
 CREATE TABLE IF NOT EXISTS games (
@@ -41,25 +44,45 @@ CREATE TABLE IF NOT EXISTS units (
     hp INTEGER NOT NULL
 );
 ```
+If these tables are not present, create them using Supabase's SQL editor or Alembic.
 
-- **If these tables are not present in Supabase, create/alter using the SQL tab or migrations.**
+## 3. Backend Migration: From SQLite
 
-## Code and Persistence Layer Changes
+A migration script is provided:  
+`backend/src/api/db_migrate_sqlite_to_supabase.py`
 
-- All database access methods in `backend/src/api/main.py` must use async SQLAlchemy with the `SUPABASE_DB_URL`.
-- Local SQLite file use (`app.db`) is fully removed.
+**How to migrate:**
+1. Ensure `.env` is present and correct.
+2. (Optional) Place your legacy `app.db` SQLite database in `backend/src/api/`.
+3. Run:
+   ```
+   cd backend/src/api
+   python db_migrate_sqlite_to_supabase.py
+   ```
+   - If `app.db` exists: All games/players/units are copied into Supabase (all current Supabase data is wiped).
+   - If `app.db` does not exist: Only Supabase tables/schema are created, no data import.
 
-## Backend Development/Deployment
+**Never run against production data you want to keep!**  
+The migration script always truncates (`delete from`) destination tables before import.
 
-- Install dependencies: `pip install -r requirements.txt`
-- Backend must use the `.env` for config/secrets.
-- Use `alembic` or SQL tab in Supabase to keep schemas in sync.
+## 4. Development and Testing
 
-## Caution
+- Backend code only talks to Supabase/Postgres via async SQLAlchemy.
+- Test your FastAPI endpoints (e.g., `/api/games/`); ensure you are reading/writing to Supabase.
+- On first project setup, **run the migration script** (even on new DB) to ensure schema exists.
+- Keep `.env` up to date for each environment.
 
-- DO NOT commit secrets or `.env` to version control.
-- Document any changes to the DB schema here as you evolve the backend.
+## 5. Keeping Schema in Sync
 
-## See also
+- To alter DB design, add models/migrations and keep schema + code in sync.
+- Use Alembic, manual migration scripts, or the Supabase SQL tab as appropriate.
+
+## 6. Further Reading
 
 - [Supabase Documentation](https://supabase.com/docs)
+- [How to get service keys/DB URLs](https://supabase.com/docs/guides/database/connecting-to-postgres)
+
+---
+
+Record any schema-altering changes and important DB documentation here as your backend evolves!
+
