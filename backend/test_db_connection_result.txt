@@ -1,0 +1,5 @@
+# This file will be overwritten with the connection test output after running the script below.
+# Test results appear after running:
+#   python src/api/test_db_connection.py
+
+(To update with actual results after test run.)
