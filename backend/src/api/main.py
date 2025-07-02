@@ -29,24 +29,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database helper (singleton)
-
-# Use the correct path if not found in current dir
-def locate_db_file():
+# =======================
+# Database Path Discovery
+# =======================
+def locate_db_file(verbose=True):
+    """
+    Searches for the SQLite DB file in priority order:
+      1. Absolute path from SQLITE_DB environment variable (MUST be set & valid)
+      2. 'app.db' in working directory (rarely correct in Docker)
+      3. Hardcoded canonical path from analysis
+    Returns the file path if found, else None (prints to stderr).
+    """
     possible_paths = [
         os.environ.get("SQLITE_DB"),
         os.path.join(os.getcwd(), "app.db"),
         "/home/kavia/workspace/code-generation/gridtactix-118083-118092/database/myapp.db"
     ]
-    for path in possible_paths:
+    reason = [
+        "SQLITE_DB env variable",
+        "app.db in current dir [" + os.getcwd() + "]",
+        "canonical project database dir"
+    ]
+    for pidx, path in enumerate(possible_paths):
         if path and os.path.exists(path):
+            # Enhanced: Check permissions
+            errors = []
+            try:
+                if not os.access(path, os.R_OK):
+                    errors.append("not readable")
+                if not os.access(path, os.W_OK):
+                    errors.append("not writable")
+            except Exception as e:
+                errors.append("permission check failed: %s" % e)
+            if errors:
+                if verbose:
+                    print(f"ERROR: Database file '{path}' ({reason[pidx]}) is " + " and ".join(errors) + ".", file=sys.stderr)
+                return None
+            if verbose:
+                print(f"INFO: Database file discovered at '{path}' ({reason[pidx]})", file=sys.stderr)
             return path
+        elif verbose and path:
+            print(f"SKIP: {reason[pidx]}: '{path}' not found.", file=sys.stderr)
+    if verbose:
+        print("ERROR: Could not locate SQLite database file (checked: env, cwd, canonical path).", file=sys.stderr)
     return None
 
-DB_FILE = locate_db_file()
+DB_FILE = locate_db_file(verbose=True)
 if not DB_FILE:
-    print("ERROR: Could not locate SQLite database file (checked for app.db and env var SQLITE_DB).", file=sys.stderr)
-    DB_FILE = "app.db"  # fallback to default, will likely fail
+    # Do not fallback to a phantom file! Exit to force correct config.
+    print("CRITICAL: Backend initialization failed due to missing or inaccessible SQLite database.\n"
+          "Check SQLITE_DB env var and volume mount. Refer to backend/DEBUG_502_BAD_GATEWAY_ANALYSIS.md.", file=sys.stderr)
+    sys.exit(5)
 
 DB_LOCK = threading.Lock()
 
@@ -56,41 +89,51 @@ def get_db_connection():
     return conn
 
 def init_db():
-    # Initialize tables and test data if needed
-    with DB_LOCK:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS games (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                status TEXT NOT NULL,
-                current_player INTEGER NOT NULL,
-                winner INTEGER
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                game_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                color TEXT NOT NULL,
-                FOREIGN KEY(game_id) REFERENCES games(id)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS units (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                game_id INTEGER NOT NULL,
-                player_id INTEGER NOT NULL,
-                x INTEGER NOT NULL,
-                y INTEGER NOT NULL,
-                hp INTEGER NOT NULL,
-                FOREIGN KEY(game_id) REFERENCES games(id),
-                FOREIGN KEY(player_id) REFERENCES players(id)
-            )
-        """)
-        conn.commit()
-        conn.close()
+    """
+    Attempt to connect and initialize tables; aborts on OSError.
+    Logs precise startup diagnostics for DB file and CWD.
+    """
+    try:
+        # Print working dir and DB file path at startup (for Docker/cwd troubleshooting)
+        print(f"FastAPI working directory: {os.getcwd()} (should match Dockerfile or Compose setting)", file=sys.stderr)
+        print(f"Using SQLite DB path: {DB_FILE}", file=sys.stderr)
+        with DB_LOCK:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS games (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL,
+                    current_player INTEGER NOT NULL,
+                    winner INTEGER
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS players (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    game_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    FOREIGN KEY(game_id) REFERENCES games(id)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS units (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    game_id INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    hp INTEGER NOT NULL,
+                    FOREIGN KEY(game_id) REFERENCES games(id),
+                    FOREIGN KEY(player_id) REFERENCES players(id)
+                )
+            """)
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print("CRITICAL: Backend failed DB/table initialization: %s" % e, file=sys.stderr)
+        sys.exit(11)
 init_db()
 
 
