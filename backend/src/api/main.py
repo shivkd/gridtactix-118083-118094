@@ -1,10 +1,31 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Path
-from fastapi.middleware.cors import CORSMiddleware
+import os
+import asyncio
 from typing import List, Dict, Optional, Set
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Path, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy import (
+    Column, Integer, String, ForeignKey, select, update
+)
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.orm import declarative_base, relationship
 from enum import Enum
-import sqlite3
-import threading
+
+from dotenv import load_dotenv
+
+# Load config
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+if not SUPABASE_DB_URL:
+    raise RuntimeError("SUPABASE_DB_URL environment variable not set. Ensure .env is present.")
+
+ASYNC_DB_URL = SUPABASE_DB_URL.replace("postgres://", "postgresql+asyncpg://")
+
+Base = declarative_base()
+engine = create_async_engine(ASYNC_DB_URL, echo=False, future=True)
+async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # FastAPI App Metadata
 app = FastAPI(
@@ -27,62 +48,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database helper (singleton)
-DB_PATH = "sqlite:///app.db"  # For production set by env, here fixed for container
-DB_FILE = "app.db"
-DB_LOCK = threading.Lock()
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    # Initialize tables and test data if needed
-    with DB_LOCK:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS games (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                status TEXT NOT NULL,
-                current_player INTEGER NOT NULL,
-                winner INTEGER
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                game_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                color TEXT NOT NULL,
-                FOREIGN KEY(game_id) REFERENCES games(id)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS units (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                game_id INTEGER NOT NULL,
-                player_id INTEGER NOT NULL,
-                x INTEGER NOT NULL,
-                y INTEGER NOT NULL,
-                hp INTEGER NOT NULL,
-                FOREIGN KEY(game_id) REFERENCES games(id),
-                FOREIGN KEY(player_id) REFERENCES players(id)
-            )
-        """)
-        conn.commit()
-        conn.close()
-init_db()
-
 # ENUMs
 class StatusEnum(str, Enum):
     waiting = "waiting"
     ongoing = "ongoing"
     finished = "finished"
 
-# SCHEMAS
+# SQLAlchemy MODELS
+class GameModel(Base):
+    __tablename__ = "games"
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String(16), nullable=False)
+    current_player = Column(Integer, nullable=False)
+    winner = Column(Integer, nullable=True)
 
+    players = relationship("PlayerModel", back_populates="game", cascade="all, delete")
+    units = relationship("UnitModel", back_populates="game", cascade="all, delete")
+
+class PlayerModel(Base):
+    __tablename__ = "players"
+    id = Column(Integer, primary_key=True, index=True)
+    game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
+    name = Column(String(64), nullable=False)
+    color = Column(String(16), nullable=False)
+
+    game = relationship("GameModel", back_populates="players")
+    units = relationship("UnitModel", back_populates="player")
+
+class UnitModel(Base):
+    __tablename__ = "units"
+    id = Column(Integer, primary_key=True, index=True)
+    game_id = Column(Integer, ForeignKey("games.id"), nullable=False, index=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    x = Column(Integer, nullable=False)
+    y = Column(Integer, nullable=False)
+    hp = Column(Integer, nullable=False)
+
+    game = relationship("GameModel", back_populates="units")
+    player = relationship("PlayerModel", back_populates="units")
+
+# ---------- Pydantic SCHEMAS ----------
 class UnitBase(BaseModel):
     x: int = Field(..., ge=0, le=5, description="Unit's x position on grid (0-indexed)")
     y: int = Field(..., ge=0, le=5, description="Unit's y position on grid (0-indexed)")
@@ -135,38 +140,42 @@ class AttackAction(BaseModel):
     attacker_id: int = Field(..., description="ID of the attacking unit")
     target_id: int = Field(..., description="ID of the unit being attacked")
 
-# Game logic helpers
-def get_game_by_id(game_id: int) -> Game:
-    with DB_LOCK:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT * FROM games WHERE id = ?", (game_id,))
-        game_row = c.fetchone()
-        if not game_row:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Game not found")
-        c.execute("SELECT * FROM players WHERE game_id = ?", (game_id,))
-        players = [Player(id=row["id"], name=row["name"], color=row["color"]) for row in c.fetchall()]
-        c.execute("SELECT * FROM units WHERE game_id = ?", (game_id,))
-        units = [Unit(id=row["id"], player_id=row["player_id"], x=row["x"], y=row["y"], hp=row["hp"]) for row in c.fetchall()]
-        game = Game(
-            id=game_row["id"],
-            status=game_row["status"],
-            current_player=game_row["current_player"],
-            winner=game_row["winner"],
-            players=players,
-            units=units
-        )
-        conn.close()
-        return game
+# Dependency for DB session
+async def get_session() -> AsyncSession:
+    async with async_session() as session:
+        yield session
+
+# ----- Utility/Game Logic Helpers (async) -----
+# PUBLIC_INTERFACE
+async def get_game_by_id(game_id: int, session: AsyncSession) -> Game:
+    """Fetch a Game and associated players & units, assembling Pydantic Game"""
+    game: GameModel = await session.get(GameModel, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+
+    # Load players and units for this game
+    players_result = await session.execute(select(PlayerModel).where(PlayerModel.game_id == game_id))
+    players = players_result.scalars().all()
+    units_result = await session.execute(select(UnitModel).where(UnitModel.game_id == game_id))
+    units = units_result.scalars().all()
+
+    out = Game(
+        id=game.id,
+        status=game.status,
+        current_player=game.current_player,
+        winner=game.winner,
+        players=[Player(id=p.id, name=p.name, color=p.color) for p in players],
+        units=[Unit(id=u.id, player_id=u.player_id, x=u.x, y=u.y, hp=u.hp) for u in units],
+    )
+    return out
 
 def next_player(game: Game) -> int:
-    idx = [p.id for p in game.players].index(game.current_player)
-    next_idx = (idx + 1) % len(game.players)
-    return game.players[next_idx].id
+    ids = [p.id for p in game.players]
+    idx = ids.index(game.current_player)
+    next_idx = (idx + 1) % len(ids)
+    return ids[next_idx]
 
 def is_adjacent(x1: int, y1: int, x2: int, y2: int) -> bool:
-    # 4-directional adjacency
     return abs(x1 - x2) + abs(y1 - y2) == 1
 
 def find_unit(unit_id: int, units: List[Unit]) -> Unit:
@@ -176,7 +185,6 @@ def find_unit(unit_id: int, units: List[Unit]) -> Unit:
     raise HTTPException(status_code=404, detail="Unit not found")
 
 def valid_move(unit: Unit, target_x: int, target_y: int, units: List[Unit]) -> bool:
-    # Unit must move to adjacent empty square
     if not (0 <= target_x < 6 and 0 <= target_y < 6):
         return False
     if not is_adjacent(unit.x, unit.y, target_x, target_y):
@@ -189,32 +197,19 @@ def valid_move(unit: Unit, target_x: int, target_y: int, units: List[Unit]) -> b
 def valid_attack(attacker: Unit, target: Unit) -> bool:
     return is_adjacent(attacker.x, attacker.y, target.x, target.y) and target.hp > 0
 
-def update_db(sql: str, params: tuple):
-    with DB_LOCK:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute(sql, params)
-        conn.commit()
-        conn.close()
-
-def set_winner_if_any(game_id: int):
+async def set_winner_if_any(game_id: int, session: AsyncSession):
     # Winner = if only one player's units have HP > 0
-    with DB_LOCK:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("""
-            SELECT player_id, COUNT(*) as count 
-            FROM units WHERE game_id=? AND hp > 0 
-            GROUP BY player_id
-        """, (game_id,))
-        alive_counts = c.fetchall()
-        if len(alive_counts) == 1:
-            winner_id = alive_counts[0]["player_id"]
-            c.execute("UPDATE games SET status=?, winner=? WHERE id=?", (StatusEnum.finished.value, winner_id, game_id))
-            conn.commit()
-        conn.close()
+    stmt = select(UnitModel.player_id).where(
+        UnitModel.game_id == game_id, UnitModel.hp > 0
+    )
+    result = await session.execute(stmt)
+    alive_player_ids = [row[0] for row in result.fetchall()]
+    if len(set(alive_player_ids)) == 1:
+        winner_id = alive_player_ids[0]
+        await session.execute(update(GameModel).where(GameModel.id == game_id).values(status=StatusEnum.finished.value, winner=winner_id))
+        await session.commit()
 
-# WebSocket manager
+# --------- WebSocket Manager (as before) ---------
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[int, Set[WebSocket]] = {}
@@ -232,10 +227,12 @@ class ConnectionManager:
                 del self.active_connections[game_id]
 
     async def broadcast(self, game_id: int, message: dict):
-        # Send to all clients in that game
         clients = self.active_connections.get(game_id, set())
-        for ws in clients:
-            await ws.send_json(message)
+        for ws in list(clients):  # make a copy, since a disconnect may change the set
+            try:
+                await ws.send_json(message)
+            except Exception:
+                self.disconnect(game_id, ws)
 
 manager = ConnectionManager()
 
@@ -243,60 +240,59 @@ manager = ConnectionManager()
 
 # PUBLIC_INTERFACE
 @app.get("/", tags=["Games"])
-def health_check():
+async def health_check():
     """Health check."""
     return {"message": "Healthy"}
 
 # PUBLIC_INTERFACE
 @app.post("/api/games/", response_model=Game, status_code=201, tags=["Games"], summary="Create new game")
-def create_game(payload: GameCreate):
+async def create_game(payload: GameCreate, session: AsyncSession = Depends(get_session)):
     """Start a new game. Initializes players and units. Returns complete game state."""
-    with DB_LOCK:
-        conn = get_db_connection()
-        c = conn.cursor()
-        # Insert the game, status waiting, first player arbitrarily 1
-        c.execute("INSERT INTO games (status, current_player) VALUES (?,?)", (StatusEnum.ongoing.value, 0))
-        game_id = c.lastrowid
+    # Create game row
+    async with session.begin():
+        game = GameModel(status=StatusEnum.ongoing.value, current_player=0)
+        session.add(game)
+        await session.flush()  # Assigns game.id
         player_ids = []
-        for idx, pl in enumerate(payload.players):
-            c.execute("INSERT INTO players (game_id, name, color) VALUES (?,?,?)", (game_id, pl.name, pl.color))
-            player_id = c.lastrowid
-            player_ids.append(player_id)
-        # Set current_player to 1st player created
-        c.execute("UPDATE games SET current_player=? WHERE id=?", (player_ids[0], game_id))
-        # Place units: each player's units in their row; HP=3 default
+        # Insert players
+        for pl in payload.players:
+            player = PlayerModel(game_id=game.id, name=pl.name, color=pl.color)
+            session.add(player)
+            await session.flush()
+            player_ids.append(player.id)
+        # Update current_player to the first player
+        game.current_player = player_ids[0]
+        await session.flush()
+        # Insert units
         for i, pid in enumerate(player_ids):
             start_row = 0 if i == 0 else 5
             for j in range(payload.units_per_player or 3):
                 x = j * (6 // (payload.units_per_player or 3))
                 y = start_row
-                c.execute("INSERT INTO units (game_id, player_id, x, y, hp) VALUES (?,?,?,?,?)",
-                          (game_id, pid, x, y, 3))
-        conn.commit()
-    return get_game_by_id(game_id)
+                unit = UnitModel(game_id=game.id, player_id=pid, x=x, y=y, hp=3)
+                session.add(unit)
+    await session.commit()
+    return await get_game_by_id(game.id, session)
 
 # PUBLIC_INTERFACE
 @app.get("/api/games/", response_model=List[Game], tags=["Games"], summary="List all games")
-def list_games():
+async def list_games(session: AsyncSession = Depends(get_session)):
     """List all games and their basic states."""
-    with DB_LOCK:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT id FROM games")
-        ids = [row["id"] for row in c.fetchall()]
-    return [get_game_by_id(gid) for gid in ids]
+    rows = await session.execute(select(GameModel.id))
+    ids = [row[0] for row in rows.fetchall()]
+    return [await get_game_by_id(gid, session) for gid in ids]
 
 # PUBLIC_INTERFACE
 @app.get("/api/games/{game_id}", response_model=Game, tags=["Games"], summary="Get a game by ID")
-def get_game(game_id: int = Path(..., gt=0, description="ID of game")):
+async def get_game(game_id: int = Path(..., gt=0, description="ID of game"), session: AsyncSession = Depends(get_session)):
     """Get the current state of a specific game (units, players, turn, winner, etc)."""
-    return get_game_by_id(game_id)
+    return await get_game_by_id(game_id, session)
 
 # PUBLIC_INTERFACE
 @app.post("/api/games/{game_id}/move", response_model=Game, tags=["Units"], summary="Move a unit")
-def move_unit(game_id: int, action: MoveAction):
+async def move_unit(game_id: int, action: MoveAction, session: AsyncSession = Depends(get_session)):
     """Move a unit to an adjacent empty cell. Only current player's unit can move."""
-    game = get_game_by_id(game_id)
+    game = await get_game_by_id(game_id, session)
     if game.status != StatusEnum.ongoing:
         raise HTTPException(status_code=400, detail="Game not in progress")
     unit = find_unit(action.unit_id, game.units)
@@ -304,22 +300,29 @@ def move_unit(game_id: int, action: MoveAction):
         raise HTTPException(status_code=403, detail="Not your turn to move")
     if not valid_move(unit, action.target_x, action.target_y, game.units):
         raise HTTPException(status_code=400, detail="Invalid move")
-    # Update db
-    update_db("UPDATE units SET x=?, y=? WHERE id=?", (action.target_x, action.target_y, unit.id))
+    # Update unit's x/y
+    await session.execute(
+        update(UnitModel)
+        .where(UnitModel.id == unit.id)
+        .values(x=action.target_x, y=action.target_y)
+    )
     # End turn
     npid = next_player(game)
-    update_db("UPDATE games SET current_player=? WHERE id=?", (npid, game_id))
-    new_game = get_game_by_id(game_id)
-    # Notify websocket clients
-    import asyncio
+    await session.execute(
+        update(GameModel)
+        .where(GameModel.id == game_id)
+        .values(current_player=npid)
+    )
+    await session.commit()
+    new_game = await get_game_by_id(game_id, session)
     asyncio.create_task(manager.broadcast(game_id, {"event": "move", "game": new_game.dict()}))
     return new_game
 
 # PUBLIC_INTERFACE
 @app.post("/api/games/{game_id}/attack", response_model=Game, tags=["Units"], summary="Attack with a unit")
-def attack_unit(game_id: int, action: AttackAction):
+async def attack_unit(game_id: int, action: AttackAction, session: AsyncSession = Depends(get_session)):
     """Attack adjacent enemy unit. Only current player's unit can attack."""
-    game = get_game_by_id(game_id)
+    game = await get_game_by_id(game_id, session)
     if game.status != StatusEnum.ongoing:
         raise HTTPException(status_code=400, detail="Game not in progress")
     attacker = find_unit(action.attacker_id, game.units)
@@ -332,46 +335,53 @@ def attack_unit(game_id: int, action: AttackAction):
         raise HTTPException(status_code=400, detail="Target is not adjacent or already defeated")
     # Apply damage: For simplicity, always 1 HP per attack
     new_hp = max(target.hp - 1, 0)
-    update_db("UPDATE units SET hp=? WHERE id=?", (new_hp, target.id))
-    set_winner_if_any(game_id)
-    # End turn
-    new_game = get_game_by_id(game_id)
+    await session.execute(
+        update(UnitModel).where(UnitModel.id == target.id).values(hp=new_hp)
+    )
+    await set_winner_if_any(game_id, session)
+    await session.commit()
+    # End turn if not finished
+    new_game = await get_game_by_id(game_id, session)
     if new_game.status != StatusEnum.finished:
         npid = next_player(game)
-        update_db("UPDATE games SET current_player=? WHERE id=?", (npid, game_id))
-        new_game = get_game_by_id(game_id)
-    # Notify websocket clients
-    import asyncio
+        await session.execute(
+            update(GameModel).where(GameModel.id == game_id).values(current_player=npid)
+        )
+        await session.commit()
+        new_game = await get_game_by_id(game_id, session)
     asyncio.create_task(manager.broadcast(game_id, {"event": "attack", "game": new_game.dict()}))
     return new_game
 
 # PUBLIC_INTERFACE
 @app.post("/api/games/{game_id}/endturn", response_model=Game, tags=["Games"], summary="End player's turn")
-def end_turn(game_id: int):
+async def end_turn(game_id: int, session: AsyncSession = Depends(get_session)):
     """Current player ends their turn (without action)."""
-    game = get_game_by_id(game_id)
+    game = await get_game_by_id(game_id, session)
     if game.status != StatusEnum.ongoing:
         raise HTTPException(status_code=400, detail="Game not in progress")
     npid = next_player(game)
-    update_db("UPDATE games SET current_player=? WHERE id=?", (npid, game_id))
-    new_game = get_game_by_id(game_id)
-    # Notify clients
-    import asyncio
+    await session.execute(
+        update(GameModel)
+        .where(GameModel.id == game_id)
+        .values(current_player=npid)
+    )
+    await session.commit()
+    new_game = await get_game_by_id(game_id, session)
     asyncio.create_task(manager.broadcast(game_id, {"event": "endturn", "game": new_game.dict()}))
     return new_game
 
 # PUBLIC_INTERFACE
 @app.get("/api/games/{game_id}/players", response_model=List[Player], tags=["Players"], summary="Get players in a game")
-def get_players(game_id: int):
+async def get_players(game_id: int, session: AsyncSession = Depends(get_session)):
     """Get all players in a specified game."""
-    game = get_game_by_id(game_id)
+    game = await get_game_by_id(game_id, session)
     return game.players
 
 # PUBLIC_INTERFACE
 @app.get("/api/games/{game_id}/units", response_model=List[Unit], tags=["Units"], summary="Get game units")
-def get_units(game_id: int):
+async def get_units(game_id: int, session: AsyncSession = Depends(get_session)):
     """Get all units in a specified game."""
-    game = get_game_by_id(game_id)
+    game = await get_game_by_id(game_id, session)
     return game.units
 
 # PUBLIC_INTERFACE
@@ -385,10 +395,10 @@ async def websocket_game_updates(websocket: WebSocket, game_id: int = Path(..., 
     await manager.connect(game_id, websocket)
     try:
         # On connect: send current game state
-        game = get_game_by_id(game_id)
+        async with async_session() as session:
+            game = await get_game_by_id(game_id, session)
         await websocket.send_json({"event": "sync", "game": game.dict()})
         while True:
-            # No client->server messages expected; keep the socket open.
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(game_id, websocket)
@@ -405,3 +415,10 @@ def websocket_usage():
         "ws_url": "/ws/games/{game_id}",
         "events": ["move", "attack", "endturn", "sync"]
     }
+
+# ---- Auto-create tables helper ----
+# You may run this once at container start to create/migrate -- but prefer to use Alembic/migrations in prod!
+@app.on_event("startup")
+async def on_startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
