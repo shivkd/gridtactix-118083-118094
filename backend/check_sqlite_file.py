@@ -1,21 +1,33 @@
 import os
 import sys
 
-DB_FILE = "app.db"  # This should match usage in main.py
+import sys
+
+def locate_db_file():
+    possible_paths = [
+        os.environ.get("SQLITE_DB"),
+        os.path.join(os.getcwd(), "app.db"),
+        "/home/kavia/workspace/code-generation/gridtactix-118083-118092/database/myapp.db"
+    ]
+    for path in possible_paths:
+        if path and os.path.exists(path):
+            return path
+    return None
 
 def check_database_file():
-    if not os.path.exists(DB_FILE):
-        print(f"ERROR: Database file '{DB_FILE}' does NOT exist.")
+    db_file = locate_db_file()
+    if not db_file:
+        print("ERROR: Could not locate SQLite database file (checked app.db and env var SQLITE_DB).")
         sys.exit(1)
     errors = []
-    if not os.access(DB_FILE, os.R_OK):
+    if not os.access(db_file, os.R_OK):
         errors.append("not readable")
-    if not os.access(DB_FILE, os.W_OK):
+    if not os.access(db_file, os.W_OK):
         errors.append("not writable")
     if errors:
-        print(f"ERROR: Database file '{DB_FILE}' is " + " and ".join(errors) + ".")
+        print(f"ERROR: Database file '{db_file}' is " + " and ".join(errors) + ".")
         sys.exit(2)
-    print(f"SUCCESS: Database file '{DB_FILE}' exists and is readable/writable.")
+    print(f"SUCCESS: Database file '{db_file}' exists and is readable/writable.")
 
 if __name__ == "__main__":
     check_database_file()

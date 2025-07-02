@@ -29,8 +29,25 @@ app.add_middleware(
 )
 
 # Database helper (singleton)
-DB_PATH = "sqlite:///app.db"  # For production set by env, here fixed for container
-DB_FILE = "app.db"
+import sys
+
+# Use the correct path if not found in current dir
+def locate_db_file():
+    possible_paths = [
+        os.environ.get("SQLITE_DB"),
+        os.path.join(os.getcwd(), "app.db"),
+        "/home/kavia/workspace/code-generation/gridtactix-118083-118092/database/myapp.db"
+    ]
+    for path in possible_paths:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+DB_FILE = locate_db_file()
+if not DB_FILE:
+    print("ERROR: Could not locate SQLite database file (checked for app.db and env var SQLITE_DB).", file=sys.stderr)
+    DB_FILE = "app.db"  # fallback to default, will likely fail
+
 DB_LOCK = threading.Lock()
 
 def get_db_connection():
